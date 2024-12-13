@@ -61,3 +61,9 @@ uart_wifi_passthrough: esp8266 bins, app source, lwip patch for ESP8266_RTOS_SDK
 uart_wifi_driver: linux host driver for esp8266
 
 the dts you can get here: https://github.com/hai012/f1c100s_lichee_nano_linux/blob/nano-4.14-exp/arch/arm/boot/dts/suniv-f1c100s-licheepi-nano.dts
+
+
+
+
+The solution is to send the IP packet from the Linux network card driver to the ESP8266 via serial port. Once received by the ESP8266, it is transmitted by the LWIP IP layer to the MAC layer interface. For receiving, a hook is placed at the interface between the ESP8266 LWIP MAC layer and IP layer, then the received data is sent to Linux host driver through the serial port.
+
