@@ -1,0 +1,116 @@
+diff --git a/src/core/init.c b/src/core/init.c
+index b3737a35..c532381a 100644
+--- a/src/core/init.c
++++ b/src/core/init.c
+@@ -328,9 +328,20 @@ PACK_STRUCT_END
+  * Initialize all modules.
+  * Use this in NO_SYS mode. Use tcpip_init() otherwise.
+  */
++#include "semphr.h"
++#include "esp_log.h"
++SemaphoreHandle_t etharp_output_mutex;
+ void
+ lwip_init(void)
+ {
++  etharp_output_mutex = xSemaphoreCreateBinary();
++  if (etharp_output_mutex == NULL) {
++      // 信号量创建失败，进行错误处理
++      ESP_LOGI(__func__, "Failed to create etharp_output_mutex");
++      return;
++  }
++  xSemaphoreGive(etharp_output_mutex);
++
+ #ifndef LWIP_SKIP_CONST_CHECK
+   int a = 0;
+   LWIP_UNUSED_ARG(a);
+diff --git a/src/core/ipv4/etharp.c b/src/core/ipv4/etharp.c
+index c8c9052f..2691ac2d 100644
+--- a/src/core/ipv4/etharp.c
++++ b/src/core/ipv4/etharp.c
+@@ -803,12 +803,17 @@ etharp_output_to_arp_index(struct netif *netif, struct pbuf *q, netif_addr_idx_t
+  * - ERR_RTE No route to destination (no gateway to external networks),
+  * or the return type of either etharp_query() or ethernet_output().
+  */
++#include "semphr.h"
++extern SemaphoreHandle_t etharp_output_mutex;
+ err_t
+ etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
+ {
+   const struct eth_addr *dest;
+   struct eth_addr mcastaddr;
+   const ip4_addr_t *dst_addr = ipaddr;
++  err_t ret;
++
++  xSemaphoreTake(etharp_output_mutex, portMAX_DELAY);
+ 
+   LWIP_ASSERT_CORE_LOCKED();
+   LWIP_ASSERT("netif != NULL", netif != NULL);
+@@ -863,7 +868,8 @@ etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
+             /* no default gateway available */
+           } else {
+             /* no route to destination error (default gateway missing) */
+-            return ERR_RTE;
++            ret = ERR_RTE;
++            goto exit;
+           }
+         }
+       }
+@@ -881,7 +887,8 @@ etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
+             (ip4_addr_cmp(dst_addr, &arp_table[etharp_cached_entry].ipaddr))) {
+           /* the per-pcb-cached entry is stable and the right one! */
+           ETHARP_STATS_INC(etharp.cachehit);
+-          return etharp_output_to_arp_index(netif, q, etharp_cached_entry);
++          ret = etharp_output_to_arp_index(netif, q, etharp_cached_entry);
++          goto exit;
+         }
+ #if LWIP_NETIF_HWADDRHINT
+       }
+@@ -898,18 +905,24 @@ etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
+           (ip4_addr_cmp(dst_addr, &arp_table[i].ipaddr))) {
+         /* found an existing, stable entry */
+         ETHARP_SET_ADDRHINT(netif, i);
+-        return etharp_output_to_arp_index(netif, q, i);
++        ret = etharp_output_to_arp_index(netif, q, i);
++        goto exit;
+       }
+     }
+     /* no stable entry found, use the (slower) query function:
+        queue on destination Ethernet address belonging to ipaddr */
+-    return etharp_query(netif, dst_addr, q);
++    ret = etharp_query(netif, dst_addr, q);
++    goto exit;
+   }
+ 
+   /* continuation for multicast/broadcast destinations */
+   /* obtain source Ethernet address of the given interface */
+   /* send packet directly on the link */
+-  return ethernet_output(netif, q, (struct eth_addr *)(netif->hwaddr), dest, ETHTYPE_IP);
++  ret = ethernet_output(netif, q, (struct eth_addr *)(netif->hwaddr), dest, ETHTYPE_IP);
++
++exit:  
++  xSemaphoreGive(etharp_output_mutex);
++  return ret;
+ }
+ 
+ /**
+diff --git a/src/core/ipv4/ip4.c b/src/core/ipv4/ip4.c
+index e3fc1dc9..cd935fe1 100644
+--- a/src/core/ipv4/ip4.c
++++ b/src/core/ipv4/ip4.c
+@@ -481,9 +481,16 @@ ip4_input_accept(struct netif *netif)
+  * @return ERR_OK if the packet was processed (could return ERR_* if it wasn't
+  *         processed, but currently always returns ERR_OK)
+  */
++extern struct netif *target_wifi_netif;
++void uart_wifi_recv(struct pbuf *p);
+ err_t
+ ip4_input(struct pbuf *p, struct netif *inp)
+ {
++  if(target_wifi_netif!=NULL) {
++    uart_wifi_recv(p);
++    pbuf_free(p);
++    return ERR_OK;
++  }
+ #if ESP_LWIP && IP_NAPT
+   struct ip_hdr *iphdr;
+ #else
